@@ -63,6 +63,16 @@ wss.on('connection', (clientWs, req) => {
     const origin = req.headers.origin || '';
     console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'client_connected', origin }));
 
+    // Realtime audio is a stream of small, frequent frames (one every
+    // ~256ms per the client's buffer size). Nagle's algorithm (on by
+    // default) can hold small TCP packets briefly hoping to coalesce them,
+    // which adds latency that's pointless here - we want every frame out
+    // immediately. Disabling it on the raw socket costs nothing since we're
+    // not sending enough data to need the coalescing.
+    if (clientWs._socket && clientWs._socket.setNoDelay) {
+        clientWs._socket.setNoDelay(true);
+    }
+
     if (ALLOWED_ORIGIN && origin !== ALLOWED_ORIGIN) {
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'origin_rejected', origin, allowed: ALLOWED_ORIGIN }));
         clientWs.close(4403, 'origin not allowed');
@@ -90,6 +100,9 @@ wss.on('connection', (clientWs, req) => {
 
     upstreamWs.on('open', () => {
         upstreamOpen = true;
+        if (upstreamWs._socket && upstreamWs._socket.setNoDelay) {
+            upstreamWs._socket.setNoDelay(true);
+        }
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'upstream_open', bufferedMessages: pending.length }));
         for (const msg of pending) upstreamWs.send(msg);
         pending.length = 0;
