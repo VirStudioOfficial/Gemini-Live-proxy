@@ -1,0 +1,16 @@
+{
+  "name": "gemini-live-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal WebSocket proxy: bridges browser <-> Gemini Live for networks that block direct access to Google.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
