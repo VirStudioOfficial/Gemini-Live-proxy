@@ -61,20 +61,22 @@ const wss = new WebSocket.Server({ server, path: '/live' });
 
 wss.on('connection', (clientWs, req) => {
     const origin = req.headers.origin || '';
+    console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'client_connected', origin }));
+
     if (ALLOWED_ORIGIN && origin !== ALLOWED_ORIGIN) {
+        console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'origin_rejected', origin, allowed: ALLOWED_ORIGIN }));
         clientWs.close(4403, 'origin not allowed');
         return;
     }
 
     const keys = getGeminiKeys();
     if (keys.length === 0) {
+        console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'no_api_key_configured' }));
         clientWs.close(4500, 'server has no GEMINI_API_KEY configured');
         return;
     }
+    console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'connecting_upstream', model: LIVE_MODEL }));
 
-    // Simple rotation: try the first key. (If you want the same
-    // try-next-key-on-failure behavior as api/chat.js, that logic would live
-    // here — kept simple for now since a single key is the common case.)
     const apiKey = keys[0];
 
     const upstreamUrl =
@@ -83,20 +85,19 @@ wss.on('connection', (clientWs, req) => {
 
     const upstreamWs = new WebSocket(upstreamUrl);
 
-    // Buffer any client messages that arrive before the upstream connection
-    // to Gemini is actually open (e.g. the initial `setup` message almost
-    // always races this).
     let upstreamOpen = false;
     const pending = [];
 
     upstreamWs.on('open', () => {
         upstreamOpen = true;
+        console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'upstream_open', bufferedMessages: pending.length }));
         for (const msg of pending) upstreamWs.send(msg);
         pending.length = 0;
     });
 
     // --- Relay: browser -> Gemini ---
     clientWs.on('message', (data) => {
+        console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'client_to_upstream', bytes: data.length, upstreamOpen }));
         if (upstreamOpen && upstreamWs.readyState === WebSocket.OPEN) {
             upstreamWs.send(data);
         } else {
@@ -106,6 +107,7 @@ wss.on('connection', (clientWs, req) => {
 
     // --- Relay: Gemini -> browser ---
     upstreamWs.on('message', (data) => {
+        console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'upstream_to_client', bytes: data.length }));
         if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.send(data);
         }
@@ -121,18 +123,23 @@ wss.on('connection', (clientWs, req) => {
         }
     };
 
-    upstreamWs.on('close', (code, reason) => closeBoth(1011, 'upstream closed'));
+    upstreamWs.on('close', (code, reason) => {
+        console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'upstream_closed', code, reason: reason?.toString() }));
+        closeBoth(1011, 'upstream closed');
+    });
     upstreamWs.on('error', (err) => {
         console.error(JSON.stringify({ ts: new Date().toISOString(), event: 'upstream_error', message: err.message }));
         closeBoth(1011, 'upstream error');
     });
 
-    clientWs.on('close', () => {
+    clientWs.on('close', (code, reason) => {
+        console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'client_closed', code, reason: reason?.toString() }));
         if (upstreamWs.readyState === WebSocket.OPEN || upstreamWs.readyState === WebSocket.CONNECTING) {
             upstreamWs.close();
         }
     });
-    clientWs.on('error', () => {
+    clientWs.on('error', (err) => {
+        console.error(JSON.stringify({ ts: new Date().toISOString(), event: 'client_error', message: err.message }));
         if (upstreamWs.readyState === WebSocket.OPEN || upstreamWs.readyState === WebSocket.CONNECTING) {
             upstreamWs.close();
         }
