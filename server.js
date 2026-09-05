@@ -39,13 +39,22 @@ function getGeminiKeys() {
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '';
 
 const server = http.createServer((req, res) => {
-    if (req.url === '/health') {
+    // Respond 200 on both `/` and `/health` so Railway's default healthcheck
+    // (which often just hits `/`) doesn't see a 404 and kill the container.
+    if (req.url === '/health' || req.url === '/') {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
         res.end('ok');
         return;
     }
     res.writeHead(404);
     res.end();
+});
+
+// Some platforms send SIGTERM on redeploys/scaling events; log it instead of
+// dying silently so it's obvious in the logs what happened.
+process.on('SIGTERM', () => {
+    console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'sigterm_received' }));
+    server.close(() => process.exit(0));
 });
 
 const wss = new WebSocket.Server({ server, path: '/live' });
