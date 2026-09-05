@@ -2,7 +2,15 @@ services:
   - type: web
     name: gemini-live-proxy
     runtime: node
-    plan: free
+    # Free plan throttles CPU heavily and sleeps when idle - both show up
+    # as exactly this symptom (delay between speaking and hearing a reply).
+    # Starter (or higher) removes both problems.
+    plan: starter
+    # Oregon is Render's US-West region, closest to most Google Cloud
+    # endpoints that serve the Gemini Live API - keeps the
+    # proxy<->Gemini leg (which runs on every audio chunk, not just once
+    # per call) as short as possible.
+    region: oregon
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /health
