@@ -1,0 +1,30 @@
+# Keeps the Render free-tier proxy awake.
+#
+# Render spins down a free web service after 15 minutes with no inbound
+# traffic (HTTP or WebSocket), and the next real request then has to wait
+# ~30-60s for the container to cold-start before the Live call can even
+# open its WebSocket - this is the single biggest latency spike in the
+# whole voice pipeline, and it's pure infrastructure wait, unrelated to
+# Gemini or the audio code.
+#
+# This workflow just hits the proxy's existing /health endpoint (see
+# server.js) every 14 minutes - one minute inside the 15-minute window -
+# so Render always sees recent traffic and never spins the service down
+# in the first place. Free on GitHub Actions for a public repo; for a
+# private repo it eats a small amount of included Actions minutes.
+name: Keep Render proxy alive
+
+on:
+  schedule:
+    - cron: '*/14 * * * *'
+  workflow_dispatch: {} # lets you trigger a manual run from the Actions tab to sanity-check the URL
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          # Replace this URL if the proxy is ever redeployed under a
+          # different Render service name.
+          curl -fsS --max-time 20 https://gemini-live-proxy-kmu4.onrender.com/health
