@@ -19,5 +19,3 @@ services:
         sync: false
       - key: ALLOWED_ORIGIN
         sync: false
-      - key: LIVE_MODEL
-        value: gemini-2.5-flash-native-audio-preview-09-2025
