@@ -23,7 +23,6 @@ const http = require('http');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 8080;
-const LIVE_MODEL = process.env.LIVE_MODEL || 'gemini-2.5-flash-native-audio-preview-09-2025';
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
 
 // Comma-separated list, same convention as the main app's api/chat.js and
@@ -57,11 +56,17 @@ process.on('SIGTERM', () => {
     server.close(() => process.exit(0));
 });
 
-const wss = new WebSocket.Server({ server, path: '/live' });
-
-wss.on('connection', (clientWs, req) => {
+// Shared connection handler for both proxy paths below. `path` is only used
+// for logging so it's obvious in Render's log stream which leg (the
+// conversational call or the transcription-only feed) a given line belongs
+// to - the relay logic itself is identical either way: whatever the client
+// sends goes upstream verbatim, whatever comes back from Gemini goes to the
+// client verbatim. Which model/config actually gets used is entirely up to
+// the `setup` message the CLIENT sends first; this proxy never inspects or
+// rewrites message contents.
+function handleProxyConnection(path, clientWs, req) {
     const origin = req.headers.origin || '';
-    console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'client_connected', origin }));
+    console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'client_connected', origin }));
 
     // Realtime audio is a stream of small, frequent frames (one every
     // ~256ms per the client's buffer size). Nagle's algorithm (on by
@@ -74,18 +79,18 @@ wss.on('connection', (clientWs, req) => {
     }
 
     if (ALLOWED_ORIGIN && origin !== ALLOWED_ORIGIN) {
-        console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'origin_rejected', origin, allowed: ALLOWED_ORIGIN }));
+        console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'origin_rejected', origin, allowed: ALLOWED_ORIGIN }));
         clientWs.close(4403, 'origin not allowed');
         return;
     }
 
     const keys = getGeminiKeys();
     if (keys.length === 0) {
-        console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'no_api_key_configured' }));
+        console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'no_api_key_configured' }));
         clientWs.close(4500, 'server has no GEMINI_API_KEY configured');
         return;
     }
-    console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'connecting_upstream', model: LIVE_MODEL }));
+    console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'connecting_upstream' }));
 
     const apiKey = keys[0];
 
@@ -103,14 +108,14 @@ wss.on('connection', (clientWs, req) => {
         if (upstreamWs._socket && upstreamWs._socket.setNoDelay) {
             upstreamWs._socket.setNoDelay(true);
         }
-        console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'upstream_open', bufferedMessages: pending.length }));
+        console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'upstream_open', bufferedMessages: pending.length }));
         for (const msg of pending) upstreamWs.send(msg);
         pending.length = 0;
     });
 
     // --- Relay: browser -> Gemini ---
     clientWs.on('message', (data) => {
-        console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'client_to_upstream', bytes: data.length, upstreamOpen }));
+        console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'client_to_upstream', bytes: data.length, upstreamOpen }));
         if (upstreamOpen && upstreamWs.readyState === WebSocket.OPEN) {
             upstreamWs.send(data);
         } else {
@@ -120,7 +125,7 @@ wss.on('connection', (clientWs, req) => {
 
     // --- Relay: Gemini -> browser ---
     upstreamWs.on('message', (data) => {
-        console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'upstream_to_client', bytes: data.length }));
+        console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'upstream_to_client', bytes: data.length }));
         if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.send(data);
         }
@@ -137,28 +142,42 @@ wss.on('connection', (clientWs, req) => {
     };
 
     upstreamWs.on('close', (code, reason) => {
-        console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'upstream_closed', code, reason: reason?.toString() }));
+        console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'upstream_closed', code, reason: reason?.toString() }));
         closeBoth(1011, 'upstream closed');
     });
     upstreamWs.on('error', (err) => {
-        console.error(JSON.stringify({ ts: new Date().toISOString(), event: 'upstream_error', message: err.message }));
+        console.error(JSON.stringify({ ts: new Date().toISOString(), path, event: 'upstream_error', message: err.message }));
         closeBoth(1011, 'upstream error');
     });
 
     clientWs.on('close', (code, reason) => {
-        console.log(JSON.stringify({ ts: new Date().toISOString(), event: 'client_closed', code, reason: reason?.toString() }));
+        console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'client_closed', code, reason: reason?.toString() }));
         if (upstreamWs.readyState === WebSocket.OPEN || upstreamWs.readyState === WebSocket.CONNECTING) {
             upstreamWs.close();
         }
     });
     clientWs.on('error', (err) => {
-        console.error(JSON.stringify({ ts: new Date().toISOString(), event: 'client_error', message: err.message }));
+        console.error(JSON.stringify({ ts: new Date().toISOString(), path, event: 'client_error', message: err.message }));
         if (upstreamWs.readyState === WebSocket.OPEN || upstreamWs.readyState === WebSocket.CONNECTING) {
             upstreamWs.close();
         }
     });
-});
+}
+
+// Conversational voice call - model/config chosen by the client's own
+// `setup` message (currently gemini-3.1-flash-live-preview, see index.html).
+const wssLive = new WebSocket.Server({ server, path: '/live' });
+wssLive.on('connection', (clientWs, req) => handleProxyConnection('/live', clientWs, req));
+
+// Transcription-only feed - a second, independent connection the client
+// opens in parallel, pointed at gemini-3.5-transcribe-live with an explicit
+// languageCodes so the on-screen Persian transcript stops being guessed as
+// Dari/other scripts. Same relay logic as /live; this route exists only so
+// two simultaneous upstream connections (with two different `setup`
+// messages) can coexist without one clobbering the other on this server.
+const wssTranscribe = new WebSocket.Server({ server, path: '/transcribe' });
+wssTranscribe.on('connection', (clientWs, req) => handleProxyConnection('/transcribe', clientWs, req));
 
 server.listen(PORT, () => {
-    console.log(`Gemini Live proxy listening on :${PORT} (model: ${LIVE_MODEL})`);
+    console.log(`Gemini Live proxy listening on :${PORT} (paths: /live, /transcribe)`);
 });
