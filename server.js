@@ -166,7 +166,7 @@ function handleProxyConnection(path, clientWs, req) {
 
 // Conversational voice call - model/config chosen by the client's own
 // `setup` message (currently gemini-3.1-flash-live-preview, see index.html).
-const wssLive = new WebSocket.Server({ server, path: '/live' });
+const wssLive = new WebSocket.Server({ noServer: true });
 wssLive.on('connection', (clientWs, req) => handleProxyConnection('/live', clientWs, req));
 
 // Transcription-only feed - a second, independent connection the client
@@ -175,8 +175,35 @@ wssLive.on('connection', (clientWs, req) => handleProxyConnection('/live', clien
 // Dari/other scripts. Same relay logic as /live; this route exists only so
 // two simultaneous upstream connections (with two different `setup`
 // messages) can coexist without one clobbering the other on this server.
-const wssTranscribe = new WebSocket.Server({ server, path: '/transcribe' });
+const wssTranscribe = new WebSocket.Server({ noServer: true });
 wssTranscribe.on('connection', (clientWs, req) => handleProxyConnection('/transcribe', clientWs, req));
+
+// FIX: two separate `new WebSocket.Server({ server, path })` instances
+// attached to the SAME http.Server do not reliably co-exist - this is a
+// long-standing, still-open limitation of the `ws` library itself (see
+// https://github.com/websockets/ws/issues/1044 and
+// https://github.com/websockets/ws/issues/1189), not something specific to
+// this proxy. In testing here it surfaced as every /live connection being
+// torn down immediately (code 1006) the instant /transcribe was added,
+// even though /transcribe was never actually opened yet - so it wasn't a
+// bug in the transcribe path itself, it was the mere presence of a second
+// `{ server, path }` instance breaking the first one.
+//
+// The documented fix is `noServer: true` on both instances (above) plus
+// manually handling the server's single `upgrade` event ourselves and
+// routing by `req.url` to whichever WebSocketServer matches - this is the
+// pattern the ws README itself recommends for "multiple servers sharing a
+// single https server".
+server.on('upgrade', (req, socket, head) => {
+    const { pathname } = new URL(req.url, `http://${req.headers.host}`);
+    if (pathname === '/live') {
+        wssLive.handleUpgrade(req, socket, head, (ws) => wssLive.emit('connection', ws, req));
+    } else if (pathname === '/transcribe') {
+        wssTranscribe.handleUpgrade(req, socket, head, (ws) => wssTranscribe.emit('connection', ws, req));
+    } else {
+        socket.destroy();
+    }
+});
 
 server.listen(PORT, () => {
     console.log(`Gemini Live proxy listening on :${PORT} (paths: /live, /transcribe)`);
