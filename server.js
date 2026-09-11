@@ -64,6 +64,51 @@ process.on('SIGTERM', () => {
 // client verbatim. Which model/config actually gets used is entirely up to
 // the `setup` message the CLIENT sends first; this proxy never inspects or
 // rewrites message contents.
+//
+// FIX (یه کلید API خراب/quota-تمام‌شده کل قابلیت ویس رو برای همه از کار
+// می‌انداخت): قبلاً همیشه فقط keys[0] رو امتحان می‌کرد، دقیقاً برخلاف
+// api/chat.js و api/live-token.js که هر دو بین چند کلید (GEMINI_API_KEYS)
+// می‌چرخند تا یه کلید خراب کل فیچر رو نخوابونه. الان اینجا هم همون الگو
+// پیاده شده: کلیدها رو به ترتیب امتحان می‌کند، فقط تا وقتی که upstream
+// هنوز واقعاً باز نشده (یعنی هیچ داده‌ی واقعی رد و بدل نشده) - بعد از باز
+// شدن موفق یه اتصال، دیگر به کلید بعدی سوییچ نمی‌کند (چون در آن نقطه
+// دیگر مشکل از کلید نیست، relay معمولی جریان دارد).
+function connectUpstreamWithKeyRotation(path, keys, keyIndex, onOpen, onMessage, onCloseOrError) {
+    if (keyIndex >= keys.length) {
+        onCloseOrError(new Error('همه‌ی کلیدهای Gemini برای این اتصال fail شدند'));
+        return;
+    }
+    const apiKey = keys[keyIndex];
+    const upstreamUrl =
+        `wss://${GEMINI_HOST}/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent` +
+        `?key=${encodeURIComponent(apiKey)}`;
+    const upstreamWs = new WebSocket(upstreamUrl);
+    let openedSuccessfully = false;
+    let settled = false; // true once we've either opened successfully or moved to the next key
+
+    upstreamWs.on('open', () => {
+        openedSuccessfully = true;
+        settled = true;
+        console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'upstream_open', keyIndex }));
+        onOpen(upstreamWs);
+    });
+    upstreamWs.on('message', (data) => onMessage(data));
+    const tryNextOrFail = (reason, extra) => {
+        if (settled && openedSuccessfully) {
+            // Already relaying real traffic on this key - this is a normal
+            // end-of-session close, not a key problem. Report upward as-is.
+            onCloseOrError(null, extra);
+            return;
+        }
+        if (settled) return; // already moved on once, ignore duplicate close/error
+        settled = true;
+        console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'upstream_key_failed', keyIndex, reason }));
+        connectUpstreamWithKeyRotation(path, keys, keyIndex + 1, onOpen, onMessage, onCloseOrError);
+    };
+    upstreamWs.on('close', (code, reason) => tryNextOrFail('close:' + code, { code, reason }));
+    upstreamWs.on('error', (err) => tryNextOrFail('error:' + err.message, { err }));
+}
+
 function handleProxyConnection(path, clientWs, req) {
     const origin = req.headers.origin || '';
     console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'client_connected', origin }));
@@ -90,76 +135,81 @@ function handleProxyConnection(path, clientWs, req) {
         clientWs.close(4500, 'server has no GEMINI_API_KEY configured');
         return;
     }
-    console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'connecting_upstream' }));
-
-    const apiKey = keys[0];
-
-    const upstreamUrl =
-        `wss://${GEMINI_HOST}/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent` +
-        `?key=${encodeURIComponent(apiKey)}`;
-
-    const upstreamWs = new WebSocket(upstreamUrl);
+    console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'connecting_upstream', totalKeys: keys.length }));
 
     let upstreamOpen = false;
+    let upstreamWsRef = null;
     const pending = [];
 
-    upstreamWs.on('open', () => {
-        upstreamOpen = true;
-        if (upstreamWs._socket && upstreamWs._socket.setNoDelay) {
-            upstreamWs._socket.setNoDelay(true);
+    connectUpstreamWithKeyRotation(
+        path,
+        keys,
+        0,
+        (upstreamWs) => {
+            // onOpen: this key worked - wire up the real relay from here on.
+            upstreamWsRef = upstreamWs;
+            upstreamOpen = true;
+            if (upstreamWs._socket && upstreamWs._socket.setNoDelay) {
+                upstreamWs._socket.setNoDelay(true);
+            }
+            console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'upstream_ready', bufferedMessages: pending.length }));
+            for (const msg of pending) upstreamWs.send(msg);
+            pending.length = 0;
+        },
+        (data) => {
+            // onMessage: relay Gemini -> browser, same as before (see the
+            // matching comment on the client->upstream side for why the
+            // per-frame log line was removed).
+            if (clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(data);
+            }
+        },
+        (err, extra) => {
+            // onCloseOrError: either every key failed (err set, before any
+            // successful open), or the successfully-opened upstream closed
+            // normally/abnormally afterward (err null, extra has code/reason).
+            if (err) {
+                console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'all_keys_failed', message: err.message }));
+                if (clientWs.readyState === WebSocket.OPEN || clientWs.readyState === WebSocket.CONNECTING) {
+                    clientWs.close(4500, 'upstream unavailable (all keys failed)');
+                }
+                return;
+            }
+            if (extra && extra.err) {
+                console.error(JSON.stringify({ ts: new Date().toISOString(), path, event: 'upstream_error', message: extra.err.message }));
+            } else if (extra) {
+                console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'upstream_closed', code: extra.code, reason: extra.reason?.toString() }));
+            }
+            if (clientWs.readyState === WebSocket.OPEN || clientWs.readyState === WebSocket.CONNECTING) {
+                clientWs.close(1011, 'upstream closed');
+            }
         }
-        console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'upstream_open', bufferedMessages: pending.length }));
-        for (const msg of pending) upstreamWs.send(msg);
-        pending.length = 0;
-    });
+    );
 
     // --- Relay: browser -> Gemini ---
+    // FIX (لاگ‌های حجیم): قبلاً هر فریم صوتی (هر ~۲۵۶ میلی‌ثانیه، برای کل
+    // مدت هر تماس) جداگانه لاگ می‌شد - روی هاست رایگان (Render) این خیلی
+    // سریع فضای لاگ رو پر می‌کرد و I/O همزمانِ console.log هم اضافه‌بار
+    // بی‌مورد به هر فریم می‌داد. الان فقط لحظه‌ی شروع/پایان و رویدادهای
+    // واقعاً مهم (تغییر کلید، خطا) لاگ می‌شوند، نه هر فریم تکی.
     clientWs.on('message', (data) => {
-        console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'client_to_upstream', bytes: data.length, upstreamOpen }));
-        if (upstreamOpen && upstreamWs.readyState === WebSocket.OPEN) {
-            upstreamWs.send(data);
+        if (upstreamOpen && upstreamWsRef && upstreamWsRef.readyState === WebSocket.OPEN) {
+            upstreamWsRef.send(data);
         } else {
             pending.push(data);
         }
     });
 
-    // --- Relay: Gemini -> browser ---
-    upstreamWs.on('message', (data) => {
-        console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'upstream_to_client', bytes: data.length }));
-        if (clientWs.readyState === WebSocket.OPEN) {
-            clientWs.send(data);
-        }
-    });
-
-    // --- Teardown: closing either side closes the other ---
-    const closeBoth = (code, reason) => {
-        if (clientWs.readyState === WebSocket.OPEN || clientWs.readyState === WebSocket.CONNECTING) {
-            clientWs.close(code, reason);
-        }
-        if (upstreamWs.readyState === WebSocket.OPEN || upstreamWs.readyState === WebSocket.CONNECTING) {
-            upstreamWs.close();
-        }
-    };
-
-    upstreamWs.on('close', (code, reason) => {
-        console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'upstream_closed', code, reason: reason?.toString() }));
-        closeBoth(1011, 'upstream closed');
-    });
-    upstreamWs.on('error', (err) => {
-        console.error(JSON.stringify({ ts: new Date().toISOString(), path, event: 'upstream_error', message: err.message }));
-        closeBoth(1011, 'upstream error');
-    });
-
     clientWs.on('close', (code, reason) => {
         console.log(JSON.stringify({ ts: new Date().toISOString(), path, event: 'client_closed', code, reason: reason?.toString() }));
-        if (upstreamWs.readyState === WebSocket.OPEN || upstreamWs.readyState === WebSocket.CONNECTING) {
-            upstreamWs.close();
+        if (upstreamWsRef && (upstreamWsRef.readyState === WebSocket.OPEN || upstreamWsRef.readyState === WebSocket.CONNECTING)) {
+            upstreamWsRef.close();
         }
     });
     clientWs.on('error', (err) => {
         console.error(JSON.stringify({ ts: new Date().toISOString(), path, event: 'client_error', message: err.message }));
-        if (upstreamWs.readyState === WebSocket.OPEN || upstreamWs.readyState === WebSocket.CONNECTING) {
-            upstreamWs.close();
+        if (upstreamWsRef && (upstreamWsRef.readyState === WebSocket.OPEN || upstreamWsRef.readyState === WebSocket.CONNECTING)) {
+            upstreamWsRef.close();
         }
     });
 }
